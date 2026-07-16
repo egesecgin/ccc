@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use chrono::{Local, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -159,11 +159,29 @@ impl Composer {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusedPanel {
+    Jobs,
+    Sessions,
+}
+
+impl FocusedPanel {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Jobs => Self::Sessions,
+            Self::Sessions => Self::Jobs,
+        }
+    }
+}
+
 struct App {
     state_path: PathBuf,
     state: QueueState,
     sessions: Vec<SessionCandidate>,
-    selected: usize,
+    job_selected: usize,
+    session_selected: usize,
+    focused_panel: FocusedPanel,
+    pending_cancel: Option<Uuid>,
     composer: Option<Composer>,
     notice: String,
     active_job: Option<Uuid>,
@@ -182,9 +200,13 @@ impl App {
             state_path,
             state,
             sessions: discover_sessions(),
-            selected: 0,
+            job_selected: 0,
+            session_selected: 0,
+            focused_panel: FocusedPanel::Sessions,
+            pending_cancel: None,
             composer: None,
-            notice: "Ready. Jobs run when due while ccc stays open.".to_owned(),
+            notice: "Sessions are read-only. Select one and press Enter or n to queue a prompt."
+                .to_owned(),
             active_job: None,
             result_tx,
             result_rx,
@@ -200,6 +222,9 @@ impl App {
 
     fn refresh_sessions(&mut self) {
         self.sessions = discover_sessions();
+        self.session_selected = self
+            .session_selected
+            .min(self.sessions.len().saturating_sub(1));
         self.notice = format!("Found {} Claude session(s).", self.sessions.len());
     }
 
@@ -253,16 +278,22 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.state.jobs.len();
+        let (len, selected) = match self.focused_panel {
+            FocusedPanel::Jobs => (self.state.jobs.len(), &mut self.job_selected),
+            FocusedPanel::Sessions => (self.sessions.len(), &mut self.session_selected),
+        };
         if len == 0 {
-            self.selected = 0;
+            *selected = 0;
             return;
         }
-        self.selected = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        *selected = (*selected as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
     fn open_composer(&mut self) {
-        self.composer = Some(Composer::new(self.sessions.first()));
+        let session = self.sessions.get(self.session_selected);
+        let mut composer = Composer::new(session);
+        composer.session_cursor = self.session_selected;
+        self.composer = Some(composer);
     }
 
     fn choose_next_session(&mut self) {
@@ -316,7 +347,7 @@ impl App {
             last_message: "Awaiting scheduled time.".to_owned(),
         });
         self.state.jobs.sort_by_key(|job| job.scheduled_at);
-        self.selected = self
+        self.job_selected = self
             .state
             .jobs
             .iter()
@@ -327,11 +358,16 @@ impl App {
     }
 
     fn run_selected_now(&mut self) {
+        if self.focused_panel != FocusedPanel::Jobs {
+            self.notice =
+                "Select a scheduled job first. Discovered sessions are read-only.".to_owned();
+            return;
+        }
         if self.active_job.is_some() {
             self.notice = "A Claude job is already running.".to_owned();
             return;
         }
-        if let Some(job) = self.state.jobs.get_mut(self.selected) {
+        if let Some(job) = self.state.jobs.get_mut(self.job_selected) {
             if job.status == JobStatus::Running {
                 self.notice = "That job is already running.".to_owned();
                 return;
@@ -343,17 +379,32 @@ impl App {
         }
     }
 
-    fn delete_selected(&mut self) {
-        let Some(job) = self.state.jobs.get(self.selected) else {
+    fn request_cancel_selected_job(&mut self) {
+        if self.focused_panel != FocusedPanel::Jobs {
+            self.notice =
+                "Sessions cannot be deleted. They are read-only Claude history files.".to_owned();
+            return;
+        }
+        let Some(job) = self.state.jobs.get(self.job_selected) else {
             return;
         };
         if job.status == JobStatus::Running {
-            self.notice = "Running jobs cannot be deleted.".to_owned();
+            self.notice = "Running jobs cannot be cancelled.".to_owned();
             return;
         }
-        self.state.jobs.remove(self.selected);
-        self.selected = self.selected.min(self.state.jobs.len().saturating_sub(1));
-        self.notice = "Job removed.".to_owned();
+        if self.pending_cancel != Some(job.id) {
+            self.pending_cancel = Some(job.id);
+            self.notice =
+                "Press x again to cancel this queued job only. Claude sessions are never deleted."
+                    .to_owned();
+            return;
+        }
+        self.state.jobs.remove(self.job_selected);
+        self.job_selected = self
+            .job_selected
+            .min(self.state.jobs.len().saturating_sub(1));
+        self.pending_cancel = None;
+        self.notice = "Queued job cancelled. The Claude session was not changed.".to_owned();
         self.save();
     }
 
@@ -362,12 +413,18 @@ impl App {
             self.handle_composer_key(key);
             return;
         }
+        if self.pending_cancel.is_some() && key.code != KeyCode::Char('x') {
+            self.pending_cancel = None;
+            self.notice = "Cancellation not confirmed. No changes made.".to_owned();
+        }
 
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('n') => self.open_composer(),
+            KeyCode::Enter if self.focused_panel == FocusedPanel::Sessions => self.open_composer(),
             KeyCode::Char('r') => self.run_selected_now(),
-            KeyCode::Char('d') => self.delete_selected(),
+            KeyCode::Char('x') => self.request_cancel_selected_job(),
+            KeyCode::Tab => self.focused_panel = self.focused_panel.toggle(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::F(5) => self.refresh_sessions(),
@@ -674,7 +731,7 @@ fn discover_sessions() -> Vec<SessionCandidate> {
     }
     sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     sessions.dedup_by(|left, right| left.session_id == right.session_id);
-    sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
     sessions
 }
 
@@ -743,8 +800,10 @@ fn shorten(value: &str, max_chars: usize) -> String {
 fn draw_ui(frame: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Min(8),
-        Constraint::Length(4),
+        Constraint::Length(2),
+        Constraint::Percentage(36),
+        Constraint::Min(9),
+        Constraint::Length(3),
     ])
     .margin(1)
     .split(frame.area());
@@ -759,12 +818,37 @@ fn draw_ui(frame: &mut Frame, app: &App) {
         Span::raw("  Claude Code continuation queue"),
         Span::styled(
             format!("   {} discovered session(s)", app.sessions.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::LightCyan),
         ),
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
+    let guidance = Paragraph::new(
+        "Discovered sessions are read-only. Select one below and press Enter or n to queue a prompt.",
+    )
+    .style(Style::default().fg(Color::Gray));
+    frame.render_widget(guidance, chunks[1]);
+
+    draw_jobs_panel(frame, app, chunks[2]);
+    draw_sessions_panel(frame, app, chunks[3]);
+
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from(
+            "Tab switch pane   j/k or arrows scroll   n or Enter queue session   r run job now   x cancel queued job   F5 refresh   q quit",
+        ),
+        Line::styled(&app.notice, Style::default().fg(Color::Gray)),
+    ]))
+    .wrap(Wrap { trim: true })
+    .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[4]);
+
+    if let Some(form) = &app.composer {
+        draw_composer(frame, form, &app.sessions);
+    }
+}
+
+fn draw_jobs_panel(frame: &mut Frame, app: &App, area: Rect) {
     let header_cells = [
         "Scheduled",
         "Status",
@@ -775,24 +859,40 @@ fn draw_ui(frame: &mut Frame, app: &App) {
     ]
     .into_iter()
     .map(|title| Cell::from(title).style(Style::default().add_modifier(Modifier::BOLD)));
-    let rows = app.state.jobs.iter().enumerate().map(|(index, job)| {
-        let selection = if index == app.selected {
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Row::new(vec![
-            Cell::from(format_schedule(job.scheduled_at)),
-            Cell::from(job.status.label()).style(Style::default().fg(job.status.color())),
-            Cell::from(shorten(&job.session_id, 12)),
-            Cell::from(format!("{}/{}", job.model, job.effort)),
-            Cell::from(shorten(&job.prompt.replace('\n', " "), 36)),
-            Cell::from(shorten(&job.last_message, 42)),
-        ])
-        .style(selection)
-    });
+    let (start, end) = visible_slice(
+        app.state.jobs.len(),
+        app.job_selected,
+        usize::from(area.height.saturating_sub(4)),
+    );
+    let rows = app.state.jobs[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, job)| {
+            let index = start + offset;
+            let selection = if index == app.job_selected && app.focused_panel == FocusedPanel::Jobs
+            {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(format_schedule(job.scheduled_at)),
+                Cell::from(job.status.label()).style(Style::default().fg(job.status.color())),
+                Cell::from(shorten(&job.session_id, 12)),
+                Cell::from(format!("{}/{}", job.model, job.effort)),
+                Cell::from(shorten(&job.prompt.replace('\n', " "), 36)),
+                Cell::from(shorten(&job.last_message, 42)),
+            ])
+            .style(selection)
+        });
+    let title = format!(
+        " Scheduled jobs ({}/{}) ",
+        displayed_position(app.job_selected, app.state.jobs.len()),
+        app.state.jobs.len()
+    );
     let table = Table::new(
         rows,
         [
@@ -805,23 +905,100 @@ fn draw_ui(frame: &mut Frame, app: &App) {
         ],
     )
     .header(Row::new(header_cells).bottom_margin(1))
-    .block(Block::default().title(" Queue ").borders(Borders::ALL))
+    .block(panel_block(title, app.focused_panel == FocusedPanel::Jobs))
     .column_spacing(1);
-    frame.render_widget(table, chunks[1]);
+    frame.render_widget(table, area);
+}
 
-    let footer = Paragraph::new(Text::from(vec![
-        Line::from(
-            "n new   r run now   d delete   j/k or arrows select   F5 rediscover sessions   q quit",
-        ),
-        Line::styled(&app.notice, Style::default().fg(Color::DarkGray)),
-    ]))
-    .wrap(Wrap { trim: true })
-    .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+fn draw_sessions_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let (start, end) = visible_slice(
+        app.sessions.len(),
+        app.session_selected,
+        usize::from(area.height.saturating_sub(4)),
+    );
+    let rows = app.sessions[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, session)| {
+            let index = start + offset;
+            let style =
+                if index == app.session_selected && app.focused_panel == FocusedPanel::Sessions {
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+            let project = if session.working_dir.as_os_str().is_empty() {
+                "Project folder unavailable".to_owned()
+            } else {
+                session.working_dir.display().to_string()
+            };
+            Row::new(vec![
+                Cell::from(format_session_modified(session.modified)),
+                Cell::from(shorten(&session.session_id, 20)),
+                Cell::from(shorten(&project, 72)),
+            ])
+            .style(style)
+        });
+    let header = ["Modified", "Session", "Project folder"]
+        .into_iter()
+        .map(|title| Cell::from(title).style(Style::default().add_modifier(Modifier::BOLD)));
+    let title = format!(
+        " Discovered sessions - read-only ({}/{}) ",
+        displayed_position(app.session_selected, app.sessions.len()),
+        app.sessions.len()
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(17),
+            Constraint::Length(23),
+            Constraint::Min(24),
+        ],
+    )
+    .header(Row::new(header).bottom_margin(1))
+    .block(panel_block(
+        title,
+        app.focused_panel == FocusedPanel::Sessions,
+    ))
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
 
-    if let Some(form) = &app.composer {
-        draw_composer(frame, form, &app.sessions);
+fn panel_block(title: String, focused: bool) -> Block<'static> {
+    let border_color = if focused { Color::Cyan } else { Color::Gray };
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+}
+
+fn visible_slice(total: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
     }
+    let capacity = capacity.max(1).min(total);
+    let selected = selected.min(total - 1);
+    let start = selected
+        .saturating_sub(capacity / 2)
+        .min(total.saturating_sub(capacity));
+    (start, start + capacity)
+}
+
+fn displayed_position(selected: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        selected.min(total - 1) + 1
+    }
+}
+
+fn format_session_modified(time: SystemTime) -> String {
+    DateTime::<Local>::from(time)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 fn draw_composer(frame: &mut Frame, form: &Composer, sessions: &[SessionCandidate]) {
@@ -897,7 +1074,7 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_schedule, shorten};
+    use super::{parse_schedule, shorten, visible_slice};
 
     #[test]
     fn parses_now() {
@@ -913,5 +1090,12 @@ mod tests {
     fn shortens_long_text() {
         assert_eq!(shorten("abcdef", 3), "abc...");
         assert_eq!(shorten("abc", 3), "abc");
+    }
+
+    #[test]
+    fn visible_slice_keeps_the_selection_in_view() {
+        assert_eq!(visible_slice(64, 0, 5), (0, 5));
+        assert_eq!(visible_slice(64, 32, 5), (30, 35));
+        assert_eq!(visible_slice(64, 63, 5), (59, 64));
     }
 }

@@ -17,6 +17,6 @@ cargo install --git https://github.com/egesecgin/ccc --tag v0.1.0
 ccc
 ```
 
-Press `n`, pick a session with `F2`, write the prompt, choose a time, then press `Ctrl+Enter`. Keep the app open, or run `ccc --worker` without the interface.
+The session list is read-only. Press `n` or `Enter`, choose a session, write the prompt, choose a time, then press `Ctrl+Enter`. `x` only cancels a queued order after confirmation; it never deletes a Claude session. Keep the app open, or run `ccc --worker` without the interface.
 
 `ccc` uses your installed `claude` command to continue the selected session. It does not bypass usage limits, sign-in, or Claude permission prompts.
