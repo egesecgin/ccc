@@ -10,6 +10,13 @@ brew install ccc
 ccc
 ```
 
+On Linux or Windows with Rust installed:
+
+```bash
+cargo install --git https://github.com/egesecgin/ccc --tag v0.1.0
+ccc
+```
+
 Press `n`, pick a session with `F2`, write the prompt, choose a time, then press `Ctrl+Enter`. Keep the app open, or run `ccc --worker` without the interface.
 
 `ccc` uses your installed `claude` command to continue the selected session. It does not bypass usage limits, sign-in, or Claude permission prompts.
