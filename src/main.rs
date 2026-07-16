@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDateTime, TimeZone};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -33,6 +33,57 @@ use uuid::Uuid;
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
 const APP_NAME: &str = "ccc";
+
+struct Choice {
+    label: &'static str,
+    value: &'static str,
+}
+
+const MODEL_CHOICES: &[Choice] = &[
+    Choice {
+        label: "Use the resumed session's model",
+        value: "",
+    },
+    Choice {
+        label: "Latest Claude Opus",
+        value: "opus",
+    },
+    Choice {
+        label: "Latest Claude Sonnet",
+        value: "sonnet",
+    },
+    Choice {
+        label: "Claude Sonnet 4.6",
+        value: "claude-sonnet-4-6",
+    },
+];
+
+const EFFORT_CHOICES: &[Choice] = &[
+    Choice {
+        label: "Use the resumed session's effort",
+        value: "",
+    },
+    Choice {
+        label: "Low",
+        value: "low",
+    },
+    Choice {
+        label: "Medium",
+        value: "medium",
+    },
+    Choice {
+        label: "High",
+        value: "high",
+    },
+    Choice {
+        label: "Extra high",
+        value: "xhigh",
+    },
+    Choice {
+        label: "Maximum",
+        value: "max",
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -116,9 +167,11 @@ impl Composer {
             session_id: String::new(),
             working_dir: String::new(),
             prompt: "Continue where you left off.".to_owned(),
-            scheduled_for: Local::now().format("%Y-%m-%d %H:%M").to_string(),
-            model: "opus".to_owned(),
-            effort: "high".to_owned(),
+            scheduled_for: (Local::now() + ChronoDuration::minutes(15))
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            model: String::new(),
+            effort: String::new(),
             active_field: 0,
             session_cursor: 0,
             error: None,
@@ -155,6 +208,15 @@ impl Composer {
             3 => &self.scheduled_for,
             4 => &self.model,
             _ => &self.effort,
+        }
+    }
+
+    fn display_value(&self, index: usize) -> String {
+        match index {
+            3 => format_composer_schedule(&self.scheduled_for),
+            4 => choice_label(MODEL_CHOICES, &self.model),
+            5 => choice_label(EFFORT_CHOICES, &self.effort),
+            _ => self.value(index).to_owned(),
         }
     }
 }
@@ -446,12 +508,48 @@ impl App {
             self.choose_next_session();
             return;
         }
+        if key.code == KeyCode::Tab {
+            self.advance_composer_field();
+            return;
+        }
+        if key.code == KeyCode::BackTab {
+            let form = self.composer.as_mut().expect("composer exists");
+            form.active_field = (form.active_field + 5) % 6;
+            return;
+        }
+
+        let active_field = self
+            .composer
+            .as_ref()
+            .expect("composer exists")
+            .active_field;
+        if active_field == 3 {
+            match key.code {
+                KeyCode::Left => self.adjust_composer_schedule(-15),
+                KeyCode::Right => self.adjust_composer_schedule(15),
+                KeyCode::Up => self.adjust_composer_schedule(60),
+                KeyCode::Down => self.adjust_composer_schedule(-60),
+                KeyCode::PageUp => self.adjust_composer_schedule(24 * 60),
+                KeyCode::PageDown => self.adjust_composer_schedule(-24 * 60),
+                KeyCode::Home => self.reset_composer_schedule(),
+                KeyCode::Enter => self.advance_composer_field(),
+                _ => {}
+            }
+            return;
+        }
+        if active_field == 4 || active_field == 5 {
+            match key.code {
+                KeyCode::Left | KeyCode::Up => self.cycle_composer_choice(active_field, -1),
+                KeyCode::Right | KeyCode::Down => self.cycle_composer_choice(active_field, 1),
+                KeyCode::Enter => self.advance_composer_field(),
+                _ => {}
+            }
+            return;
+        }
 
         let form = self.composer.as_mut().expect("composer exists");
         form.error = None;
         match key.code {
-            KeyCode::Tab => form.active_field = (form.active_field + 1) % 6,
-            KeyCode::BackTab => form.active_field = (form.active_field + 5) % 6,
             KeyCode::Enter if form.active_field == 2 => form.current_value_mut().push('\n'),
             KeyCode::Enter => form.active_field = (form.active_field + 1) % 6,
             KeyCode::Backspace => {
@@ -461,6 +559,34 @@ impl App {
                 form.current_value_mut().clear();
             }
             KeyCode::Char(character) => form.current_value_mut().push(character),
+            _ => {}
+        }
+    }
+
+    fn advance_composer_field(&mut self) {
+        let form = self.composer.as_mut().expect("composer exists");
+        form.active_field = (form.active_field + 1) % 6;
+    }
+
+    fn reset_composer_schedule(&mut self) {
+        let form = self.composer.as_mut().expect("composer exists");
+        form.scheduled_for = (Local::now() + ChronoDuration::minutes(15))
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+
+    fn adjust_composer_schedule(&mut self, minutes: i64) {
+        let form = self.composer.as_mut().expect("composer exists");
+        let fallback = (Local::now() + ChronoDuration::minutes(15)).timestamp();
+        let timestamp = parse_schedule(&form.scheduled_for).unwrap_or(fallback);
+        form.scheduled_for = format_schedule(timestamp.saturating_add(minutes * 60));
+    }
+
+    fn cycle_composer_choice(&mut self, field: usize, delta: isize) {
+        let form = self.composer.as_mut().expect("composer exists");
+        match field {
+            4 => form.model = next_choice_value(MODEL_CHOICES, &form.model, delta).to_owned(),
+            5 => form.effort = next_choice_value(EFFORT_CHOICES, &form.effort, delta).to_owned(),
             _ => {}
         }
     }
@@ -575,17 +701,18 @@ fn run_job(job: &Job) -> RunResult {
         };
     }
 
-    let output = Command::new("claude")
+    let mut command = Command::new("claude");
+    command
         .current_dir(&job.working_dir)
         .arg("--resume")
-        .arg(&job.session_id)
-        .arg("--model")
-        .arg(&job.model)
-        .arg("--effort")
-        .arg(&job.effort)
-        .arg("--print")
-        .arg(&job.prompt)
-        .output();
+        .arg(&job.session_id);
+    if !job.model.trim().is_empty() {
+        command.arg("--model").arg(&job.model);
+    }
+    if !job.effort.trim().is_empty() {
+        command.arg("--effort").arg(&job.effort);
+    }
+    let output = command.arg("--print").arg(&job.prompt).output();
 
     match output {
         Ok(output) => {
@@ -676,7 +803,7 @@ fn parse_schedule(input: &str) -> Result<i64, String> {
         return Ok(Local::now().timestamp());
     }
     let naive = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M")
-        .map_err(|_| "Use `now` or a local time such as 2026-07-16 20:30.".to_owned())?;
+        .map_err(|_| "Choose a time with the schedule controls.".to_owned())?;
     Local
         .from_local_datetime(&naive)
         .single()
@@ -693,6 +820,39 @@ fn format_schedule(timestamp: i64) -> String {
         .single()
         .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "unknown time".to_owned())
+}
+
+fn format_composer_schedule(value: &str) -> String {
+    parse_schedule(value)
+        .ok()
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .map(|time| time.format("%a %d %b %Y, %H:%M").to_string())
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn choice_label(choices: &[Choice], value: &str) -> String {
+    choices
+        .iter()
+        .find(|choice| choice.value == value)
+        .map(|choice| choice.label.to_owned())
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn next_choice_value<'a>(choices: &'a [Choice], value: &str, delta: isize) -> &'a str {
+    let current = choices
+        .iter()
+        .position(|choice| choice.value == value)
+        .unwrap_or(0) as isize;
+    let next = (current + delta).rem_euclid(choices.len() as isize) as usize;
+    choices[next].value
+}
+
+fn job_model_and_effort(job: &Job) -> String {
+    format!(
+        "{} / {}",
+        choice_label(MODEL_CHOICES, &job.model),
+        choice_label(EFFORT_CHOICES, &job.effort)
+    )
 }
 
 fn discover_sessions() -> Vec<SessionCandidate> {
@@ -882,7 +1042,7 @@ fn draw_jobs_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(format_schedule(job.scheduled_at)),
                 Cell::from(job.status.label()).style(Style::default().fg(job.status.color())),
                 Cell::from(shorten(&job.session_id, 12)),
-                Cell::from(format!("{}/{}", job.model, job.effort)),
+                Cell::from(job_model_and_effort(job)),
                 Cell::from(shorten(&job.prompt.replace('\n', " "), 36)),
                 Cell::from(shorten(&job.last_message, 42)),
             ])
@@ -1005,18 +1165,18 @@ fn draw_composer(frame: &mut Frame, form: &Composer, sessions: &[SessionCandidat
     let area = centered_rect(84, 78, frame.area());
     frame.render_widget(Clear, area);
     let fields = [
-        ("Session ID", form.value(0)),
-        ("Working directory", form.value(1)),
-        ("Prompt", form.value(2)),
-        ("Run at", form.value(3)),
-        ("Model", form.value(4)),
-        ("Effort", form.value(5)),
+        "Session ID",
+        "Working directory",
+        "Prompt",
+        "Run at",
+        "Model",
+        "Effort",
     ];
     let mut lines = vec![Line::styled(
         "Queue a Claude Code continuation",
         Style::default().add_modifier(Modifier::BOLD),
     )];
-    for (index, (label, value)) in fields.iter().enumerate() {
+    for (index, label) in fields.iter().enumerate() {
         let style = if index == form.active_field {
             Style::default()
                 .fg(Color::Cyan)
@@ -1025,9 +1185,9 @@ fn draw_composer(frame: &mut Frame, form: &Composer, sessions: &[SessionCandidat
             Style::default()
         };
         let display = if *label == "Prompt" {
-            value.replace('\n', " ")
+            form.value(index).replace('\n', " ")
         } else {
-            (*value).to_owned()
+            form.display_value(index)
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{:>18}: ", label), style),
@@ -1043,7 +1203,11 @@ fn draw_composer(frame: &mut Frame, form: &Composer, sessions: &[SessionCandidat
         Style::default().fg(Color::DarkGray),
     ));
     lines.push(Line::styled(
-        "Enter moves on (or adds a prompt line). Ctrl+Enter queues. Esc cancels.",
+        "Run at: Left/Right 15 min, Up/Down 1 hour, PgUp/PgDn 1 day, Home reset.",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::styled(
+        "Model and effort: Left/Right choose. Enter moves on. Ctrl+Enter queues. Esc cancels.",
         Style::default().fg(Color::DarkGray),
     ));
     if let Some(error) = &form.error {
@@ -1074,7 +1238,7 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_schedule, shorten, visible_slice};
+    use super::{next_choice_value, parse_schedule, shorten, visible_slice, MODEL_CHOICES};
 
     #[test]
     fn parses_now() {
@@ -1097,5 +1261,12 @@ mod tests {
         assert_eq!(visible_slice(64, 0, 5), (0, 5));
         assert_eq!(visible_slice(64, 32, 5), (30, 35));
         assert_eq!(visible_slice(64, 63, 5), (59, 64));
+    }
+
+    #[test]
+    fn model_picker_cycles_through_known_claude_values() {
+        assert_eq!(next_choice_value(MODEL_CHOICES, "", 1), "opus");
+        assert_eq!(next_choice_value(MODEL_CHOICES, "opus", -1), "");
+        assert_eq!(next_choice_value(MODEL_CHOICES, "claude-sonnet-4-6", 1), "");
     }
 }
